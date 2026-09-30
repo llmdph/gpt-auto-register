@@ -64,12 +64,14 @@ class AuthResult:
         self.refresh_token: str = ""
         self.cookie_header: str = ""
         self.totp_secret: str = ""
+        self.agent_runtime_id: str = ""
+        self.agent_private_key: str = ""
 
     def is_valid(self) -> bool:
         return bool(self.session_token and self.access_token)
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "email": self.email,
             "password": self.password,
             "session_token": self.session_token,
@@ -81,6 +83,10 @@ class AuthResult:
             "cookie_header": self.cookie_header,
             "totp_secret": self.totp_secret,
         }
+        if self.agent_runtime_id:
+            d["agent_runtime_id"] = self.agent_runtime_id
+            d["agent_private_key"] = self.agent_private_key
+        return d
 
 
 class AuthFlow:
@@ -658,8 +664,9 @@ class AuthFlow:
         scope = (os.getenv("OAUTH_CODEX_SCOPE", "") or "").strip() or "openid email profile offline_access"
         state = self._b64url_no_pad(secrets.token_bytes(24))
         verifier, challenge = self._build_pkce_pair()
+        # default empty: post-register cookies already exist; prompt=login often forces add-phone
         prompt = (
-            (os.getenv("OAUTH_CODEX_PROMPT", "login") or "").strip()
+            (os.getenv("OAUTH_CODEX_PROMPT", "") or "").strip()
             if prompt_override is None
             else (prompt_override or "").strip()
         )
@@ -1343,7 +1350,8 @@ class AuthFlow:
 
         logger.info("尝试 Codex OAuth 直连换取 refresh_token ...")
         try:
-            auth_url, state, verifier, redirect_uri, client_id = self._build_codex_authorize()
+            # 1st: silent / no-prompt (reuse register session)
+            auth_url, state, verifier, redirect_uri, client_id = self._build_codex_authorize(prompt_override="")
             self._oauth_auth_url = auth_url
             self._oauth_client_id = client_id
             self._oauth_redirect_uri = redirect_uri
@@ -1351,8 +1359,27 @@ class AuthFlow:
             self._manual_login_verifier = verifier
             self._captured_login_verifier = verifier
             callback_url, final_url = self._follow_authorize_for_callback(
-                auth_url, redirect_uri, "codex_authorize"
+                auth_url, redirect_uri, "codex_authorize_silent"
             )
+            # 2nd: optional explicit prompt from env if silent failed
+            if not callback_url:
+                prompt_env = (os.getenv("OAUTH_CODEX_PROMPT", "") or "").strip()
+                if prompt_env:
+                    auth_url2, state2, verifier2, redirect_uri2, client_id2 = self._build_codex_authorize(
+                        prompt_override=prompt_env
+                    )
+                    auth_url, state, verifier, redirect_uri, client_id = (
+                        auth_url2, state2, verifier2, redirect_uri2, client_id2
+                    )
+                    self._oauth_auth_url = auth_url
+                    self._oauth_client_id = client_id
+                    self._oauth_redirect_uri = redirect_uri
+                    self._oauth_state = state
+                    self._manual_login_verifier = verifier
+                    self._captured_login_verifier = verifier
+                    callback_url, final_url = self._follow_authorize_for_callback(
+                        auth_url, redirect_uri, f"codex_authorize_prompt_{prompt_env}"
+                    )
 
             # 若被打回 /log-in，补走一次协议登录，再继续授权链路
             if (not callback_url) and "/log-in" in (final_url or ""):
@@ -1389,27 +1416,54 @@ class AuthFlow:
                             "codex_post_login",
                         )
 
-            # Codex authorize 直接被打到 /add-phone（不经过 /log-in）：
-            # 如果配了 SMS 接码 controller，先把手机号绑了再重新 authorize
-            if (not callback_url) and self._is_add_phone_state(page_type="", continue_url=final_url or "") \
-                    and self._sms_callback is not None:
-                logger.info("Codex 授权直接落到 /add-phone，尝试 SMS 接码绑号 ...")
-                try:
-                    self._handle_add_phone_via_sms(continue_url=final_url)
-                    # 绑号成功后重新 authorize 拿 callback code
-                    callback_url, final_url = self._follow_authorize_for_callback(
-                        auth_url, redirect_uri, "codex_authorize_after_add_phone"
+            # Codex authorize 直接被打到 /add-phone（不经过 /log-in）
+            if not callback_url:
+                logger.info(
+                    "Codex authorize 中间态: final=%s is_add_phone=%s sms=%s",
+                    (final_url or "")[:180],
+                    self._is_add_phone_state(page_type="", continue_url=final_url or ""),
+                    bool(self._sms_callback),
+                )
+            if (not callback_url) and self._is_add_phone_state(page_type="", continue_url=final_url or ""):
+                # 1) 有 SMS 接码：绑号后重新 authorize
+                if self._sms_callback is not None:
+                    logger.info("Codex 授权直接落到 /add-phone，尝试 SMS 接码绑号 ...")
+                    try:
+                        self._handle_add_phone_via_sms(continue_url=final_url)
+                        callback_url, final_url = self._follow_authorize_for_callback(
+                            auth_url, redirect_uri, "codex_authorize_after_add_phone"
+                        )
+                        if not callback_url:
+                            no_prompt_url = self._drop_query_keys(auth_url, {"prompt"})
+                            if no_prompt_url and no_prompt_url != auth_url:
+                                callback_url, final_url = self._follow_authorize_for_callback(
+                                    no_prompt_url,
+                                    redirect_uri,
+                                    "codex_authorize_noprompt_after_add_phone",
+                                )
+                    except Exception as e:
+                        logger.warning(f"SMS 接码绑号失败: {e}")
+
+                # 2) 无 SMS 时也做 authorize 刷新重试（部分号会绕过 add-phone）
+                if (not callback_url) and self._env_flag("OAUTH_CODEX_ADD_PHONE_REFRESH_RETRY", "1"):
+                    try:
+                        retry_count = max(1, int(os.getenv("OAUTH_CODEX_ADD_PHONE_REFRESH_RETRY_COUNT", "5")))
+                    except Exception:
+                        retry_count = 5
+                    try:
+                        retry_sleep = max(0.0, float(os.getenv("OAUTH_CODEX_ADD_PHONE_REFRESH_SLEEP", "1.5")))
+                    except Exception:
+                        retry_sleep = 1.5
+                    logger.info(
+                        "Codex 命中 add-phone 且无 callback，authorize 刷新重试: count=%s sleep=%.1fs",
+                        retry_count, retry_sleep,
                     )
-                    if not callback_url:
-                        no_prompt_url = self._drop_query_keys(auth_url, {"prompt"})
-                        if no_prompt_url and no_prompt_url != auth_url:
-                            callback_url, final_url = self._follow_authorize_for_callback(
-                                no_prompt_url,
-                                redirect_uri,
-                                "codex_authorize_noprompt_after_add_phone",
-                            )
-                except Exception as e:
-                    logger.warning(f"SMS 接码绑号失败: {e}")
+                    callback_url, final_url = self._codex_refresh_retry_after_add_phone(
+                        auth_url=auth_url,
+                        redirect_uri=redirect_uri,
+                        attempts=retry_count,
+                        sleep_seconds=retry_sleep,
+                    )
 
             # 兜底：去掉 prompt=login 再发起一次授权
             if not callback_url:
@@ -1433,6 +1487,34 @@ class AuthFlow:
             )
         except Exception as e:
             logger.warning(f"Codex OAuth 交换异常: {e}")
+            return False
+
+    def codex_agent_identity_exchange(self) -> bool:
+        """通过 Agent Identity API 注册 Ed25519 密钥对，绕过 add-phone 获取 Codex 凭证。"""
+        if not self.result.access_token:
+            logger.warning("Agent Identity: 无 accessToken，跳过")
+            return False
+        try:
+            from codex_agent import (
+                generate_ed25519_keypair,
+                register_codex_agent,
+                extract_account_info,
+            )
+            logger.info("尝试 Agent Identity 注册（绕过 add-phone）...")
+            private_key_b64, public_key_ssh = generate_ed25519_keypair()
+            agent_runtime_id = register_codex_agent(
+                self.session, self.result.access_token, public_key_ssh,
+            )
+            self.result.agent_runtime_id = agent_runtime_id
+            self.result.agent_private_key = private_key_b64
+            info = extract_account_info(self.result.access_token)
+            logger.info(
+                "Agent Identity 注册成功: agent_runtime_id=%s account=%s",
+                agent_runtime_id[:20] + "...", info.get("account_id", "")[:20],
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"Agent Identity 注册失败（不影响已有凭证）: {e}")
             return False
 
     def _inject_pkce_into_auth_url(self, auth_url: str) -> str:
@@ -3317,7 +3399,20 @@ class AuthFlow:
                             f"收码链路已失效并 mark dead, 跳过 retry resend"
                         )
                         raise
-                    # 否则 (非号池场景, 如 catch_all CF KV) 给一次 resend retry
+                    # CF 临时邮箱 / 一次性邮箱：同邮箱二次等 OTP 多半仍是静默拒发，直接换号
+                    is_cf_temp = (
+                        mail_provider.__class__.__name__ == "CFTempEmailProvider"
+                        or bool(getattr(mail_provider, "is_throwaway_email", False))
+                    )
+                    no_retry = self._env_flag("OTP_EXISTING_NO_RETRY", "1" if is_cf_temp else "0")
+                    if is_cf_temp or no_retry:
+                        logger.warning(
+                            "未等到已有账号 OTP，放弃当前邮箱并换号（CF/临时邮箱不二次等待） email=%s",
+                            email,
+                        )
+                        raise
+
+                    # 否则给一次 resend retry
                     logger.warning("未等到已有账号 OTP，先重发后重试等待")
                     otp_sent_at = time.time()
                     if not self.kickoff_otp_delivery("existing_timeout_retry"):
@@ -3444,22 +3539,46 @@ class AuthFlow:
             except Exception as e:
                 logger.warning(f"session_ready 回调失败（不影响注册）: {e}")
 
-        # Codex OAuth refresh_token 交换（独立 authorize 链路，不依赖上面 callback 的 code）
+        # Codex 凭证：优先 OAuth RT，失败再 Agent Identity
         if callback_url or continue_url:
             self.fetch_client_auth_session_dump("pre_oauth_exchange_register")
-            # 注意：oauth_token_exchange(callback_url) 会和 NextAuth 抢同一个 code，
-            # 默认禁用避免冲突；只有用户显式 SET OAUTH_TOKEN_EXCHANGE_FROM_CALLBACK=1
-            # 才尝试（极少需要，access_token 已通过 NextAuth callback 拿到）。
             if self._env_flag("OAUTH_TOKEN_EXCHANGE_FROM_CALLBACK", "0") \
                     and not self._env_flag("SKIP_OAUTH_TOKEN_EXCHANGE", "0"):
                 self.oauth_token_exchange(callback_url or "", continue_url or "")
-            if (not self.result.refresh_token) and self._env_flag("OAUTH_CODEX_RT_EXCHANGE", "1"):
-                self.oauth_codex_rt_exchange(mail_provider=mail_provider)
-            if (not self.result.refresh_token) and self._env_flag("OAUTH_SECONDARY_AUTHORIZE_EXCHANGE", "0"):
-                self.oauth_secondary_authorize_exchange()
-            # 最终再拉一次 session（Codex 流程可能更新 cookie/access_token）
+
+            # 1) Codex OAuth RT（sub2api oauth 导入需要）
+            if (
+                not self.result.refresh_token
+                and not self._env_flag("SKIP_OAUTH_TOKEN_EXCHANGE", "0")
+                and self._env_flag("OAUTH_CODEX_RT_EXCHANGE", "1")
+            ):
+                ok_rt = self.oauth_codex_rt_exchange(mail_provider=mail_provider)
+                if ok_rt and self.result.refresh_token:
+                    logger.info(
+                        "Codex OAuth RT ok (rt_len=%s at_len=%s)",
+                        len(self.result.refresh_token or ""),
+                        len(self.result.access_token or ""),
+                    )
+                else:
+                    logger.warning("Codex OAuth RT missing refresh_token")
+
+            # 2) Agent Identity fallback when no RT
+            agent_fallback = self._env_flag("CODEX_AGENT_IDENTITY_FALLBACK", "1")
+            if (not self.result.refresh_token) and (not self.result.agent_runtime_id) and agent_fallback:
+                self.codex_agent_identity_exchange()
+            elif self.result.refresh_token and self._env_flag("CODEX_AGENT_IDENTITY_ALWAYS", "0"):
+                if not self.result.agent_runtime_id:
+                    self.codex_agent_identity_exchange()
+
+            # final ChatGPT session pull; preserve RT/id_token
             if not refresh_only_mode:
+                saved_rt = self.result.refresh_token
+                saved_id = self.result.id_token
                 self.get_auth_session()
+                if saved_rt and not self.result.refresh_token:
+                    self.result.refresh_token = saved_rt
+                if saved_id and not self.result.id_token:
+                    self.result.id_token = saved_id
 
         if refresh_only_mode:
             if not (self.result.refresh_token or self.result.access_token):
@@ -3671,8 +3790,6 @@ class AuthFlow:
         callback_url = ""
         if continue_url:
             continue_url = self._normalize_continue_url(continue_url)
-            if (not self.result.refresh_token) and self._env_flag("OAUTH_CODEX_RT_BEFORE_CALLBACK", "1"):
-                self.oauth_codex_rt_exchange(mail_provider=mail_provider)
             pre_exchange_default = "1" if refresh_only_mode else "0"
             pre_exchange = self._env_flag("OAUTH_EXCHANGE_BEFORE_CALLBACK", pre_exchange_default)
             if pre_exchange:
@@ -3689,12 +3806,28 @@ class AuthFlow:
         if callback_url or continue_url:
             self.fetch_client_auth_session_dump("pre_oauth_exchange_protocol")
             self.oauth_token_exchange(callback_url or "", continue_url or "")
-            if (not self.result.refresh_token) and self._env_flag("OAUTH_CODEX_RT_EXCHANGE", "1"):
-                self.oauth_codex_rt_exchange(mail_provider=mail_provider)
-            if (not self.result.refresh_token) and self._env_flag("OAUTH_SECONDARY_AUTHORIZE_EXCHANGE", "0"):
-                self.oauth_secondary_authorize_exchange()
+
+            if (
+                not self.result.refresh_token
+                and not self._env_flag("SKIP_OAUTH_TOKEN_EXCHANGE", "0")
+                and self._env_flag("OAUTH_CODEX_RT_EXCHANGE", "1")
+            ):
+                ok_rt = self.oauth_codex_rt_exchange(mail_provider=mail_provider)
+                if not ok_rt:
+                    logger.warning("protocol login: Codex OAuth RT failed")
+
+            agent_fallback = self._env_flag("CODEX_AGENT_IDENTITY_FALLBACK", "1")
+            if (not self.result.refresh_token) and (not self.result.agent_runtime_id) and agent_fallback:
+                self.codex_agent_identity_exchange()
+
             if not refresh_only_mode:
+                saved_rt = self.result.refresh_token
+                saved_id = self.result.id_token
                 self.get_auth_session()
+                if saved_rt and not self.result.refresh_token:
+                    self.result.refresh_token = saved_rt
+                if saved_id and not self.result.id_token:
+                    self.result.id_token = saved_id
 
         if refresh_only_mode:
             if not (self.result.refresh_token or self.result.access_token):

@@ -60,6 +60,7 @@ class CFTempEmailProvider(MailProvider):
     kind = "cf_temp"
     display_name = "CF Worker 临时邮箱"
     pooled = False         # 地址自己造，无限量，不走号池
+    is_throwaway_email = True  # OTP 超时直接换号，不二次等待
     ephemeral = True       # 每次新地址 → OpenAI 永远当新号
 
     line_segments = 0      # 不支持导入

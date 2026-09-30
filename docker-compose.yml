@@ -1,0 +1,18 @@
+services:
+  gpt-outlook:
+    build: .
+    container_name: gpt-outlook-register
+    network_mode: host
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PYTHONUNBUFFERED: "1"
+      OPENAI_SENTINEL_NODE_PATH: /usr/bin/node
+      # default proxy for jobs if UI leaves blank; registrar still prefers options.proxy
+      PROXY: ${PROXY:-http://127.0.0.1:40080}
+    volumes:
+      - /opt/gpt-outlook-register:/app
+      - /opt/gpt-outlook-register/data:/app/data
+    working_dir: /app
+    command: ["python", "start_webui.py", "--host", "0.0.0.0", "--port", "8765", "--no-browser"]

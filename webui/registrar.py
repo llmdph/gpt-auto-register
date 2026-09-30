@@ -207,6 +207,14 @@ def _do_register(
             env_overrides["SKIP_OAUTH_TOKEN_EXCHANGE"] = "1"
             env_overrides["OAUTH_CODEX_RT_EXCHANGE"] = "0"
             env_overrides["OAUTH_CODEX_RT_BEFORE_CALLBACK"] = "0"
+            env_overrides["CODEX_AGENT_IDENTITY_FALLBACK"] = "1"
+        else:
+            # default: run Codex OAuth RT then sub2api oauth import
+            env_overrides["OAUTH_CODEX_RT_EXCHANGE"] = os.environ.get("OAUTH_CODEX_RT_EXCHANGE", "1") or "1"
+            env_overrides.setdefault(
+                "CODEX_AGENT_IDENTITY_FALLBACK",
+                os.environ.get("CODEX_AGENT_IDENTITY_FALLBACK", "1") or "1",
+            )
         # PROXY 走 cfg.proxy，无需 env
 
         cfg = Config()
@@ -299,10 +307,12 @@ def _do_register(
             need_session = options.get("want_session_token", True)
             need_refresh = options.get("want_refresh_token", True)
             # 用户勾选的凭证全拿到 → 算正常完成（不视为 partial）
+            # agent_runtime_id 可替代 refresh_token（Agent Identity 模式）
+            has_rt_or_agent = bool(d.get("refresh_token") or d.get("agent_runtime_id"))
             wanted_ok = (
                 (not need_access or d.get("access_token"))
                 and (not need_session or d.get("session_token"))
-                and (not need_refresh or d.get("refresh_token"))
+                and (not need_refresh or has_rt_or_agent)
             )
             has_any = bool(
                 d.get("access_token") or d.get("refresh_token") or d.get("session_token")
@@ -333,6 +343,9 @@ def _do_register(
         if options.get("want_refresh_token", True):
             d["refresh_token"] = full.get("refresh_token", "")
             d["id_token"] = full.get("id_token", "")
+        if full.get("agent_runtime_id"):
+            d["agent_runtime_id"] = full["agent_runtime_id"]
+            d["agent_private_key"] = full.get("agent_private_key", "")
 
         # ─ 密码回读：必须在 2FA 之前 ─
         # ⚠️ d 是**本轮内存里**的结果，它不一定知道这个号有密码：
